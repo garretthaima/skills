@@ -48,7 +48,8 @@ how to serve it. Without the file the skills fall back to defaults and say so.
 
 The three read-only agents are held to read-only `git` and `gh` by a hook
 (`plugins/flow/scripts/readonly_agent_bash.py`). It does nothing outside those
-agents.
+agents. It needs `python3` on the PATH: if the hook cannot run, Claude Code
+blocks the Bash call instead of letting an unguarded one through.
 
 ## What is not here, on purpose
 

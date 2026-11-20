@@ -3,12 +3,13 @@ name: docs-audit
 disable-model-invocation: true
 description: Check the living docs against the code. Read-only agents check every factual claim, the user sees the full findings report and confirms once, then one issue and one PR fix the prose. Use before a release or on a cadence.
 argument-hint: "[<path>...] [--dry-run]"
-allowed-tools: Agent, Read, Grep, Glob, Bash(git:*), Bash(gh:*)
+allowed-tools: Agent, Read, Grep, Glob, Bash(git fetch:*), Bash(git worktree list:*), Bash(git worktree add --detach:*), Bash(git rev-parse:*), Bash(git ls-files:*), Bash(gh issue view:*), Bash(gh issue list:*)
 ---
 
 You are the **driver** of a docs audit. `$ARGUMENTS` limits the sweep to paths;
 empty means every living doc. `--dry-run` stops after the report. Nothing is
-filed or edited before the one confirm in step 4.
+filed or edited before the one confirm in step 4; the only thing this run
+creates before it is its own scratch worktree, which it also removes.
 
 Read the `## Docs` section of `.claude/flow.md` first (shape and defaults:
 `${CLAUDE_PLUGIN_ROOT}/references/project-contract.md`).
@@ -17,13 +18,13 @@ Read the `## Docs` section of `.claude/flow.md` first (shape and defaults:
 
 - Fetch the base branch. A path argument that does not exist there is reported
   as not found and is not audited.
-- Remove leftover `.claude/worktrees/docs-audit-*` worktrees not dated today.
-  A same-day one may be another session's audit: leave it, and list it in the
-  step 4 report with its `git worktree remove --force <path>` command.
+- Leave every other `.claude/worktrees/docs-audit-*` worktree alone: it may be
+  another session's audit. List each in the step 4 report with its
+  `git worktree remove --force <path>` command, for the owner to run.
 - Add a detached worktree for the auditors, since the main checkout may be
   stale or dirty:
   `git worktree add --detach .claude/worktrees/docs-audit-<YYYY-MM-DD>-<HHMMSS>-<short sha> origin/<base>`.
-  It is removed after step 3, on every path.
+  It is this run's own, and is removed after step 3, on every path.
 - Take the living docs from the contract's docs index in that worktree. Skip
   dated records and generated sections. With no contract, take every tracked
   `*.md` except `CHANGELOG.md`.
@@ -87,7 +88,8 @@ and no question.
   to check each finding against the code again before editing, and to skip any
   that does not hold, saying why in the PR body. Every number it writes
   carries, in the PR body, the command that produced it.
-- **Independent review** by `flow:code-reviewer`, dispatched by you. Ask it to
+- **Independent review** by `flow:code-reviewer`, dispatched by you, with
+  `origin/<base>` as the base after a `git fetch`. Ask it to
   read each changed doc whole, not only the hunks: a deletion can leave half a
   table behind. A reviewer that stops without a verdict is not a pass.
 - Merge under the `drive` skill's Merging section.

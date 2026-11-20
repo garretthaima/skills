@@ -15,7 +15,8 @@ refused.
 
 ## Inputs
 
-The driver gives you the absolute worktree path and the base branch.
+The driver gives you the absolute worktree path and the base ref, normally
+`origin/<base>`, fetched by the driver. You cannot fetch.
 
 ## Do
 

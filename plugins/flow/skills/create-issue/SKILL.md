@@ -1,7 +1,7 @@
 ---
 name: create-issue
 description: Create a well-formed GitHub issue with the right labels, after checking it is not already tracked. Use when the user wants to file an issue, capture a bug, feature or task, or turn a finding into tracked work.
-allowed-tools: Read, Bash(gh:*), Bash(git:*)
+allowed-tools: Read, Bash(gh issue list:*), Bash(gh issue view:*), Bash(gh label list:*), Bash(gh repo view:*)
 ---
 
 Create a GitHub issue that is clear, correctly labeled and not a duplicate.
@@ -20,8 +20,8 @@ gh issue list --state open --limit 100 \
   --json number,title -q '.[] | "#\(.number) \(.title)"'
 
 # b. epic or tracking-issue checklists: a plan-of-record line IS tracking and
-#    never appears in a title search
-gh issue view <epic> --json body -q .body | grep -i "<distinctive term>"
+#    never appears in a title search. Read the body and look for the term.
+gh issue view <epic> --json body -q .body
 
 # c. recently closed issues: the fix may already have landed
 gh issue list --state closed --limit 30 --search "<distinctive term>" \
@@ -58,7 +58,12 @@ priority).
 Never invent a label. If one is missing, propose adding it where the repo
 defines its labels.
 
-## 4. Create and link
+## 4. Confirm, then create and link
+
+If the user asked for this issue in so many words, or a skill that already
+holds the user's yes is calling (`drive`, `docs-audit`, `close-epic`), create
+it. Otherwise you are filing on your own initiative: show the drafted title,
+body, labels and any epic edit, and ask once before creating anything.
 
 ```bash
 gh issue create --title "<title>" \

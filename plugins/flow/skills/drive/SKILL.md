@@ -33,8 +33,10 @@ are in `${CLAUDE_PLUGIN_ROOT}/references/project-contract.md`.
   at most three running at once. Give each the issue number and anything you
   know that the issue body does not say. Start issues that touch the same files
   one after the other, not together.
-- **Review is yours to dispatch**, never the author's: send `flow:code-reviewer`
-  the worktree path and the base branch once the PR is open. Send findings back
+- **Review is yours to dispatch**, never the author's: once the PR is open, run
+  `git fetch` and send `flow:code-reviewer` the worktree path and
+  `origin/<base>` as the base. The local base branch goes stale as this run
+  merges PRs, and the reviewer cannot fetch. Send findings back
   to the same author agent (SendMessage; if it is gone, a fresh
   `flow:issue-owner` on the same worktree and PR), then have the changed parts
   reviewed again.

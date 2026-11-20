@@ -2,7 +2,7 @@
 name: pre-merge-review
 description: Full review of the current branch before merge. Runs the project's checks, then reviews the diff against the repo's own rules, security basics and database changes. Use when the user asks to review a branch or says it is ready to merge.
 context: fork
-allowed-tools: Read, Grep, Glob, Bash(git:*), Bash(gh:*), Bash(npm:*), Bash(make:*), Bash(cd:*)
+allowed-tools: Read, Grep, Glob, Bash(git diff:*), Bash(git log:*), Bash(git status:*), Bash(git rev-parse:*), Bash(git merge-base:*), Bash(git fetch:*), Bash(gh pr view:*), Bash(npm run:*), Bash(npm test:*), Bash(npm audit:*), Bash(make:*), Bash(wc:*)
 ---
 
 Review the current branch before merge. Follow every step in order. You do not
@@ -13,14 +13,16 @@ edit code.
 - Read `.claude/flow.md` (shape and defaults:
   `${CLAUDE_PLUGIN_ROOT}/references/project-contract.md`). Take the base branch
   from `## Base`.
-- `git diff <base>...HEAD --stat` and `git log <base>..HEAD --oneline`.
+- `git fetch`, then `git diff origin/<base>...HEAD --stat` and
+  `git log origin/<base>..HEAD --oneline`. The local base branch may be stale.
 
 ## 2. Run the checks
 
 Run the commands under `## Checks` in the contract, exactly as written. With no
 contract, use the check command named in `CLAUDE.md`. Report failures with the
 real counts. A test that fails and then passes on a second run is a finding,
-not green.
+not green. A check command outside npm and make is not pre-approved and asks
+for permission; that is expected.
 
 ## 3. Review the diff against the repo's own rules
 
