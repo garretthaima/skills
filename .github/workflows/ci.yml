@@ -1,0 +1,23 @@
+name: CI
+
+on:
+    pull_request:
+    push:
+        branches: [main]
+
+permissions:
+    contents: read
+
+jobs:
+    check:
+        name: Hook tests and manifest check
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: '3.12'
+            - name: Hook tests
+              run: python3 -m unittest discover tests
+            - name: Manifests and frontmatter
+              run: python3 scripts/check_plugins.py

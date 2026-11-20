@@ -1,0 +1,11 @@
+{
+    "name": "flow",
+    "displayName": "Flow",
+    "version": "0.1.0",
+    "description": "Issue to merged PR: file issues, drive them with one agent each, review independently, merge, close epics, audit docs",
+    "author": {
+        "name": "garretthaima"
+    },
+    "repository": "https://github.com/garretthaima/skills",
+    "keywords": ["workflow", "github", "review", "issues"]
+}
