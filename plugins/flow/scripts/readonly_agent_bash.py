@@ -31,15 +31,17 @@ GIT_READ = {
     "blame", "merge-base", "cat-file", "describe", "shortlog", "rev-list",
     "name-rev", "for-each-ref", "branch", "tag", "remote", "worktree",
 }
-# `git branch` / `tag` are read-only only in their listing forms, so this is a
-# positive allowlist: any other flag (-d, -m, --set-upstream-to=, ...) is rejected.
-BRANCH_TAG_FLAGS = {
+# `git branch` / `git tag`: listing only, and only with these flags. No flag
+# that takes a value and no positional is accepted. Git hands the next word to
+# a value flag whatever it looks like (`--format -l name` creates `name`), so
+# the only form that cannot be misread is one with no values in it. Use
+# `git for-each-ref` to filter or format.
+BRANCH_FLAGS = {
     "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "-l", "--list",
-    "--show-current", "--contains", "--merged", "--no-merged", "--format", "--sort",
+    "--show-current",
 }
-# Flags whose value may be the next token (`--contains <sha>`, `--format <fmt>`).
-BRANCH_TAG_VALUE_FLAGS = {"--contains", "--merged", "--no-merged", "--format", "--sort"}
-# No dots or slashes: git reads a name that is not a configured remote as a path.
+TAG_FLAGS = {"-l", "--list", "-n"}
+CAT_FILE_FLAGS = {"-p", "-t", "-s", "-e"}
 REMOTE_NAME = re.compile(r"^[\w-]+$")
 
 # gh: only these command groups (an unknown first word could be an extension or
@@ -59,9 +61,14 @@ GH_API_HEADERS = re.compile(r"^(accept|x-github-api-version)\s*:", re.I)
 # OWNER/REPO. gh also takes HOST/OWNER/REPO, which sends the request elsewhere.
 OWNER_REPO = re.compile(r"^[\w.-]+/[\w.-]+$")
 HOST_OWNER_REPO = re.compile(r"^[\w.-]+(/[\w.-]+){2,}$")
+# `git@host:o/r`, `user@host/o/r` and `host:443/o/r` name a host too.
+HOST_IN_WORD = re.compile(r"@[\w.-]+[:/]|^[\w.-]+:\d+/")
+# `gh repo view` reads its positional as a repository on any host, so its
+# arguments are parsed in full: these flags, each with a value, and one repo.
+GH_REPO_VIEW_VALUE_FLAGS = {"--json", "-q", "--jq", "-t", "--template", "-b", "--branch"}
 GITHUB_URL = "https://github.com/"
 # jq's `env` and `$ENV` print the process environment, tokens included.
-JQ_ENVIRONMENT = re.compile(r"\benv\b|\$ENV|\$__")
+JQ_ENVIRONMENT = re.compile(r"\benv\b|\$ENV")
 
 SAFE_REDIRECT = re.compile(r"(?:2>&1|2>[ \t]*/dev/null|>[ \t]*/dev/null)(?=[ \t;|&\n]|$)")
 # Outside quotes these start an expansion, a substitution, a subshell, a
@@ -116,6 +123,11 @@ def split_commands(command):
             current.append(" ")
             i = SAFE_REDIRECT.match(command, i).end()
             continue
+        elif char == "~" and not (i and re.match(r"[\w^~@.-]", command[i - 1])):
+            # Bash expands `~`, `~+` and `~user` at the start of a word and after
+            # `=` or `:`, so the program would get another path than the one
+            # checked here. `HEAD~1` is not an expansion.
+            return None, f"tilde expansion is not allowed; {QUOTE_HINT}"
         elif char in UNQUOTED_FORBIDDEN:
             return None, (
                 f"shell expansion, redirection or comment ({char!r}) is not allowed; {QUOTE_HINT}"
@@ -137,53 +149,24 @@ def split_commands(command):
     return [s for s in segments if s.strip()], None
 
 
-def branch_tag_ok(rest):
-    """`git branch` / `git tag` listing forms only. A positional is allowed only
-    as a --list pattern; without --list a bare name would create a branch or tag."""
-    listing = "--list" in rest or "-l" in rest
-    i = 0
-    while i < len(rest):
-        arg = rest[i]
-        name = arg.split("=", 1)[0]
-        if arg.startswith("-"):
-            if name not in BRANCH_TAG_FLAGS:
-                return False
-            takes_value = arg in BRANCH_TAG_VALUE_FLAGS
-            if takes_value and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
-                i += 1
-        elif not listing:
-            return False
-        i += 1
-    return True
-
-
-def remote_ok(rest, where):
-    # `git remote [-v] add|rename|remove|set-url ...` writes config, and the -v
-    # may come first, so strip it before looking at the subcommand.
+def remote_ok(rest):
+    # `git remote [-v]` and `git remote get-url <name>` only. add, rename,
+    # remove and set-url write config. `show` contacts the remote, and git
+    # reads a name that is not configured as a path: a folder committed in the
+    # branch under review.
     while rest and rest[0] in ("-v", "--verbose"):
         rest = rest[1:]
     if not rest:
         return True
-    if rest[0] not in ("show", "get-url"):
-        return False
-    # A configured remote's name only. A URL would send a request to any host,
-    # and git reads any other name as a path: a folder of that name could be a
-    # repository committed in the branch under review.
-    for arg in rest[1:]:
-        if arg.startswith("-"):
-            continue
-        if not REMOTE_NAME.match(arg) or os.path.exists(os.path.join(where, arg)):
-            return False
-    return True
+    return rest[0] == "get-url" and len(rest) == 2 and bool(REMOTE_NAME.match(rest[1]))
 
 
 def grep_runs_a_pager(rest):
     """`git grep -O<cmd>` / `--open-files-in-pager=<cmd>` runs a program. Git
     accepts the short flag inside a bundle (`-nO<cmd>`) and the long one
-    abbreviated (`--open=<cmd>`)."""
+    abbreviated (`--open=<cmd>`). Checked on every word, `--` or not: git reads
+    a `--` that follows `-e` as the pattern, not as the end of the options."""
     for arg in rest:
-        if arg == "--":
-            return False
         name = arg.split("=", 1)[0]
         if re.match(r"^-[^-]*O", arg):
             return True
@@ -238,9 +221,19 @@ def git_ok(args, cwd):
     if sub == "worktree":
         return None if rest[:1] == ["list"] else "only `git worktree list` is allowed"
     if sub == "remote":
-        return None if remote_ok(rest, where) else "only `git remote`, `show <name>` and `get-url <name>` with a configured remote are allowed"
+        return None if remote_ok(rest) else "only `git remote -v` and `git remote get-url <name>` are allowed"
     if sub in ("branch", "tag"):
-        return None if branch_tag_ok(rest) else f"only the listing forms of `git {sub}` are allowed"
+        flags = BRANCH_FLAGS if sub == "branch" else TAG_FLAGS
+        if all(arg in flags for arg in rest):
+            return None
+        return f"only plain listing forms of `git {sub}` are allowed; use `git for-each-ref`"
+    if sub == "cat-file":
+        # --filters and --textconv run the repo's filters, which a committed
+        # file can point at another host.
+        flags = [a for a in rest if a.startswith("-")]
+        return None if all(a in CAT_FILE_FLAGS for a in flags) else "git cat-file takes -p, -t, -s or -e only"
+    if "--ext-diff" in rest:
+        return "--ext-diff runs a program"
     # --output writes a file. Git does not accept it abbreviated.
     if any(a == "--output" or a.startswith("--output=") for a in rest):
         return "--output writes a file"
@@ -262,6 +255,10 @@ def gh_api_ok(rest):
             if arg.lstrip("/").lower().startswith("graphql"):
                 return "gh api graphql is not allowed"
             endpoints += 1
+            i += 1
+            continue
+        if arg.upper() == "-XGET":
+            method = "GET"
             i += 1
             continue
         known = (GH_API_METHOD_FLAGS | GH_API_VALUE_FLAGS | GH_API_HEADER_FLAGS
@@ -310,7 +307,7 @@ def gh_host_reason(args):
             i += 1
         elif re.match(r"^-[A-Za-z]*R.", arg):
             repo = arg.split("R", 1)[1].lstrip("=")
-        elif not arg.startswith("-") and HOST_OWNER_REPO.match(arg):
+        elif not arg.startswith("-") and (HOST_OWNER_REPO.match(arg) or HOST_IN_WORD.search(arg)):
             return "HOST/OWNER/REPO is not allowed; name the repo as OWNER/REPO"
         if repo is not None and not OWNER_REPO.match(repo):
             return "--repo must be OWNER/REPO"
@@ -318,18 +315,51 @@ def gh_host_reason(args):
     return None
 
 
+def gh_repo_view_reason(rest):
+    repos, i = 0, 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg.startswith("-"):
+            if arg.split("=", 1)[0] not in GH_REPO_VIEW_VALUE_FLAGS:
+                return f"gh repo view flag {arg!r} is not allowed"
+            if "=" not in arg:
+                i += 1
+        elif OWNER_REPO.match(arg) or arg.startswith(GITHUB_URL):
+            repos += 1
+        else:
+            return "gh repo view takes OWNER/REPO or a https://github.com/ URL"
+        i += 1
+    return None if repos <= 1 else "gh repo view takes one repository"
+
+
+def jq_reads_environment(args):
+    """A jq filter that uses `env` or `$ENV`, which print the environment.
+
+    Looks at every flag word (covers `--jq=…` and the attached `-q…`) and at
+    the word after `--jq` or after a short flag bundle holding `q`.
+    """
+    for i, arg in enumerate(args):
+        if not arg.startswith("-"):
+            continue
+        takes_next = arg == "--jq" or (not arg.startswith("--") and "q" in arg)
+        following = args[i + 1] if takes_next and i + 1 < len(args) else ""
+        if JQ_ENVIRONMENT.search(arg) or JQ_ENVIRONMENT.search(following):
+            return True
+    return False
+
+
 def gh_ok(args):
     """None when this gh call is a read of github.com, otherwise why it is refused."""
     if not args:
         return "bare gh"
-    if any(JQ_ENVIRONMENT.search(a) for a in args):
+    if jq_reads_environment(args):
         return "jq `env` and `$ENV` are not allowed (they print the environment)"
     if args[0] == "api":
         return gh_api_ok(args[1:])
     # --web opens a browser; -w is its short form and may sit in a bundle.
     # `gh run list -w` is --workflow, and that command has no --web.
     short_w = args[:2] != ["run", "list"]
-    if any(a == "--web" or (short_w and re.match(r"^-[A-Za-z]*w", a)) for a in args):
+    if any(a.startswith("--web") or (short_w and re.match(r"^-[A-Za-z]*w", a)) for a in args):
         return "--web opens a browser"
     reason = gh_host_reason(args[1:])
     if reason:
@@ -337,6 +367,8 @@ def gh_ok(args):
     if args[0] == "search":
         ok = len(args) >= 2 and not args[1].startswith("-")
         return None if ok else "gh search needs a type"
+    if args[:2] == ["repo", "view"]:
+        return gh_repo_view_reason(args[2:])
     # gh <noun> <verb> ...  e.g. gh pr view 12
     if args[0] in GH_NOUNS and len(args) >= 2 and args[1] in GH_READ_VERBS:
         return None

