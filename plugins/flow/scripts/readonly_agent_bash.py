@@ -39,7 +39,8 @@ BRANCH_TAG_FLAGS = {
 }
 # Flags whose value may be the next token (`--contains <sha>`, `--format <fmt>`).
 BRANCH_TAG_VALUE_FLAGS = {"--contains", "--merged", "--no-merged", "--format", "--sort"}
-REMOTE_NAME = re.compile(r"^[\w.-]+$")
+# No dots or slashes: git reads a name that is not a configured remote as a path.
+REMOTE_NAME = re.compile(r"^[\w-]+$")
 
 # gh: only these command groups (an unknown first word could be an extension or
 # an alias, which is an arbitrary program), and only their read verbs.
@@ -48,16 +49,28 @@ GH_READ_VERBS = {"view", "list", "diff", "checks", "status"}
 # `gh api`: a positive allowlist. A flag not listed here is refused, which also
 # refuses every bundled short form (`-iXDELETE`, `-ifbody=x`).
 GH_API_FLAGS = {"-i", "--include", "--paginate", "--slurp", "--silent", "--verbose"}
-GH_API_VALUE_FLAGS = {
-    "-H", "--header", "-q", "--jq", "-t", "--template", "--cache", "-p", "--preview",
-}
+GH_API_VALUE_FLAGS = {"-q", "--jq", "-t", "--template", "--cache", "-p", "--preview"}
+GH_API_HEADER_FLAGS = {"-H", "--header"}
 GH_API_METHOD_FLAGS = {"-X", "--method"}
+# Fields turn the request into a POST unless the method is given as GET.
+GH_API_FIELD_FLAGS = {"-f", "--raw-field", "-F", "--field"}
+# A header can ask a server to treat a GET as another method, so only these.
+GH_API_HEADERS = re.compile(r"^(accept|x-github-api-version)\s*:", re.I)
+# OWNER/REPO. gh also takes HOST/OWNER/REPO, which sends the request elsewhere.
+OWNER_REPO = re.compile(r"^[\w.-]+/[\w.-]+$")
+HOST_OWNER_REPO = re.compile(r"^[\w.-]+(/[\w.-]+){2,}$")
+GITHUB_URL = "https://github.com/"
+# jq's `env` and `$ENV` print the process environment, tokens included.
+JQ_ENVIRONMENT = re.compile(r"\benv\b|\$ENV|\$__")
 
-SAFE_REDIRECTS = re.compile(r"(?<!\S)(?:2>&1|2>/dev/null|>/dev/null)(?!\S)")
-# Outside quotes these start an expansion, a substitution, a subshell or a redirect.
-UNQUOTED_FORBIDDEN = set("$`\\{}*?[]()<>")
+SAFE_REDIRECT = re.compile(r"(?:2>&1|2>[ \t]*/dev/null|>[ \t]*/dev/null)(?=[ \t;|&\n]|$)")
+# Outside quotes these start an expansion, a substitution, a subshell, a
+# redirect or a comment. A comment matters: bash drops the words after `#`,
+# so the guard would be checking words that never reach the program.
+UNQUOTED_FORBIDDEN = set("$`\\{}*?[]()<>#")
 # Inside double quotes bash still expands these.
 DOUBLE_QUOTED_FORBIDDEN = set("$`\\")
+QUOTE_HINT = "single-quote the argument if it is meant literally"
 
 
 def is_read_only_agent(agent_type):
@@ -84,20 +97,30 @@ def split_commands(command):
     segments, current, quote, i = [], [], None, 0
     while i < len(command):
         char = command[i]
+        # Bash and this parser disagree about control characters (a carriage
+        # return is an ordinary character to bash), so none are accepted.
+        if char not in "\n\t" and (ord(char) < 32 or ord(char) == 127):
+            return None, "control characters are not allowed"
         if quote == "'":
             quote = None if char == "'" else quote
             current.append(char)
         elif quote == '"':
             if char in DOUBLE_QUOTED_FORBIDDEN:
-                return None, "expansion inside double quotes is not allowed"
+                return None, f"expansion inside double quotes is not allowed; {QUOTE_HINT}"
             quote = None if char == '"' else quote
             current.append(char)
         elif char in "'\"":
             quote = char
             current.append(char)
+        elif char in "2>" and (i == 0 or command[i - 1] in " \t") and SAFE_REDIRECT.match(command, i):
+            current.append(" ")
+            i = SAFE_REDIRECT.match(command, i).end()
+            continue
         elif char in UNQUOTED_FORBIDDEN:
-            return None, f"shell expansion or redirection ({char!r}) is not allowed"
-        elif char in ";|&\r\n":
+            return None, (
+                f"shell expansion, redirection or comment ({char!r}) is not allowed; {QUOTE_HINT}"
+            )
+        elif char in ";|&\n":
             pair = command[i:i + 2]
             if pair in ("&&", "||", "|&", ";;"):
                 i += 1
@@ -134,7 +157,7 @@ def branch_tag_ok(rest):
     return True
 
 
-def remote_ok(rest):
+def remote_ok(rest, where):
     # `git remote [-v] add|rename|remove|set-url ...` writes config, and the -v
     # may come first, so strip it before looking at the subcommand.
     while rest and rest[0] in ("-v", "--verbose"):
@@ -143,8 +166,15 @@ def remote_ok(rest):
         return True
     if rest[0] not in ("show", "get-url"):
         return False
-    # A configured remote's name only: a URL here would send a request to any host.
-    return all(arg.startswith("-") or REMOTE_NAME.match(arg) for arg in rest[1:])
+    # A configured remote's name only. A URL would send a request to any host,
+    # and git reads any other name as a path: a folder of that name could be a
+    # repository committed in the branch under review.
+    for arg in rest[1:]:
+        if arg.startswith("-"):
+            continue
+        if not REMOTE_NAME.match(arg) or os.path.exists(os.path.join(where, arg)):
+            return False
+    return True
 
 
 def grep_runs_a_pager(rest):
@@ -162,41 +192,65 @@ def grep_runs_a_pager(rest):
     return False
 
 
+def looks_like_git_dir(path):
+    return any(os.path.exists(os.path.join(path, name)) for name in ("HEAD", "objects", "refs"))
+
+
+def inside_checkout(path):
+    """True when git, started in `path`, would find a checkout or a worktree.
+
+    Git walks up from `path` and stops at the first repository, bare ones
+    included. A bare repository committed inside a branch under review would
+    bring its own config (diff.external, core.fsmonitor), which git would run,
+    so the walk must reach a `.git` entry before anything laid out like one.
+    """
+    path = os.path.realpath(path)
+    if not os.path.isdir(path):
+        return False
+    while True:
+        if os.path.exists(os.path.join(path, ".git")):
+            return True
+        if looks_like_git_dir(path):
+            return False
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+
+
 def git_ok(args, cwd):
+    """None when this git call is a read, otherwise why it is refused."""
     # Global options: -C <path> and --no-pager only. -c is not allowed (it sets config).
     i, where = 0, cwd
     while i < len(args) and args[i].startswith("-"):
         if args[i] == "-C" and i + 1 < len(args):
             where = os.path.join(where, args[i + 1])
-            # A checkout or a worktree has a `.git` entry. A bare repository does
-            # not, and one committed inside a branch under review would bring its
-            # own config (diff.external, core.fsmonitor), which git would run.
-            if not os.path.exists(os.path.join(where, ".git")):
-                return False
+            if not inside_checkout(where):
+                return "git -C must point inside a checkout or a worktree"
             i += 2
         elif args[i] in ("--no-pager", "--no-optional-locks"):
             i += 1
         else:
-            return False
+            return f"git global option {args[i]!r} is not allowed"
     if i >= len(args) or args[i] not in GIT_READ:
-        return False
+        return "not a read-only git subcommand"
     sub, rest = args[i], args[i + 1:]
     if sub == "worktree":
-        return rest[:1] == ["list"]
+        return None if rest[:1] == ["list"] else "only `git worktree list` is allowed"
     if sub == "remote":
-        return remote_ok(rest)
+        return None if remote_ok(rest, where) else "only `git remote`, `show <name>` and `get-url <name>` with a configured remote are allowed"
     if sub in ("branch", "tag"):
-        return branch_tag_ok(rest)
-    # --output writes a file.
-    if any(a.startswith("--output") for a in rest):
-        return False
+        return None if branch_tag_ok(rest) else f"only the listing forms of `git {sub}` are allowed"
+    # --output writes a file. Git does not accept it abbreviated.
+    if any(a == "--output" or a.startswith("--output=") for a in rest):
+        return "--output writes a file"
     if sub == "grep" and grep_runs_a_pager(rest):
-        return False
-    return True
+        return "git grep must not open a pager program"
+    return None
 
 
 def gh_api_ok(rest):
-    endpoints, i = 0, 0
+    endpoints, fields, method, i = 0, False, None, 0
     while i < len(rest):
         arg = rest[i]
         name, has_value, value = arg.partition("=")
@@ -204,67 +258,119 @@ def gh_api_ok(rest):
             # GitHub's own API only: a full URL would send the request, and
             # anything put in it, to another host.
             if "://" in arg:
-                return False
+                return "gh api takes an endpoint path, not a URL"
+            if arg.lstrip("/").lower().startswith("graphql"):
+                return "gh api graphql is not allowed"
             endpoints += 1
-        elif arg in GH_API_FLAGS:
-            pass
-        elif name in GH_API_METHOD_FLAGS or name in GH_API_VALUE_FLAGS:
-            if name.startswith("--") and has_value:
-                given = value
-            elif not has_value and i + 1 < len(rest):
-                given = rest[i + 1]
-                i += 1
-            else:
-                return False
-            if name in GH_API_METHOD_FLAGS and given.upper() != "GET":
-                return False
+            i += 1
+            continue
+        known = (GH_API_METHOD_FLAGS | GH_API_VALUE_FLAGS | GH_API_HEADER_FLAGS
+                 | GH_API_FIELD_FLAGS)
+        if arg in GH_API_FLAGS:
+            i += 1
+            continue
+        if name not in known:
+            return f"gh api flag {name!r} is not allowed"
+        if name.startswith("--") and has_value:
+            given = value
+        elif not has_value and i + 1 < len(rest):
+            given = rest[i + 1]
+            i += 1
         else:
-            return False
+            return f"gh api flag {name!r} needs its value as a separate word"
+        if name in GH_API_METHOD_FLAGS:
+            method = given.upper()
+            if method != "GET":
+                return "gh api may only GET"
+        elif name in GH_API_HEADER_FLAGS and not GH_API_HEADERS.match(given):
+            return "gh api header is not allowed (Accept and X-GitHub-Api-Version only)"
+        elif name in GH_API_FIELD_FLAGS:
+            fields = True
+            # `key=@file` uploads a local file.
+            if "=" not in given or given.split("=", 1)[1].startswith("@"):
+                return "gh api field must be key=value and must not read a file"
         i += 1
-    return endpoints == 1
+    if fields and method != "GET":
+        return "gh api fields make a POST unless `-X GET` is given"
+    return None if endpoints == 1 else "gh api needs exactly one endpoint"
+
+
+def gh_host_reason(args):
+    """Why these gh arguments would reach a host other than github.com, or None."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if "://" in arg and not arg.startswith(GITHUB_URL):
+            return "only https://github.com/ URLs are allowed"
+        repo = None
+        if arg.startswith("--repo="):
+            repo = arg.split("=", 1)[1]
+        elif arg == "--repo" or re.match(r"^-[A-Za-z]*R$", arg):
+            repo = args[i + 1] if i + 1 < len(args) else ""
+            i += 1
+        elif re.match(r"^-[A-Za-z]*R.", arg):
+            repo = arg.split("R", 1)[1].lstrip("=")
+        elif not arg.startswith("-") and HOST_OWNER_REPO.match(arg):
+            return "HOST/OWNER/REPO is not allowed; name the repo as OWNER/REPO"
+        if repo is not None and not OWNER_REPO.match(repo):
+            return "--repo must be OWNER/REPO"
+        i += 1
+    return None
 
 
 def gh_ok(args):
+    """None when this gh call is a read of github.com, otherwise why it is refused."""
     if not args:
-        return False
-    # --web opens a browser; -w is its short form and may sit in a bundle.
-    if any(a == "--web" or re.match(r"^-[A-Za-z]*w", a) for a in args):
-        return False
+        return "bare gh"
+    if any(JQ_ENVIRONMENT.search(a) for a in args):
+        return "jq `env` and `$ENV` are not allowed (they print the environment)"
     if args[0] == "api":
         return gh_api_ok(args[1:])
+    # --web opens a browser; -w is its short form and may sit in a bundle.
+    # `gh run list -w` is --workflow, and that command has no --web.
+    short_w = args[:2] != ["run", "list"]
+    if any(a == "--web" or (short_w and re.match(r"^-[A-Za-z]*w", a)) for a in args):
+        return "--web opens a browser"
+    reason = gh_host_reason(args[1:])
+    if reason:
+        return reason
     if args[0] == "search":
-        return len(args) >= 2 and not args[1].startswith("-")
+        ok = len(args) >= 2 and not args[1].startswith("-")
+        return None if ok else "gh search needs a type"
     # gh <noun> <verb> ...  e.g. gh pr view 12
-    return args[0] in GH_NOUNS and len(args) >= 2 and args[1] in GH_READ_VERBS
+    if args[0] in GH_NOUNS and len(args) >= 2 and args[1] in GH_READ_VERBS:
+        return None
+    return "not a read-only gh command"
 
 
-def segment_ok(segment, cwd):
+def segment_reason(segment, cwd):
     tokens = shlex.split(segment)
     if not tokens:
-        return True
+        return None
     prog, args = tokens[0], tokens[1:]
     if prog == "git":
         return git_ok(args, cwd)
     if prog == "gh":
         return gh_ok(args)
-    return False
+    return "only git and gh may run"
 
 
 def decide(command, cwd=None):
     """The reason `command` is refused, or None when it is allowed."""
     if not command.strip():
         return "empty command"
-    segments, reason = split_commands(SAFE_REDIRECTS.sub(" ", command))
+    segments, reason = split_commands(command)
     if reason:
         return reason
     if not segments:
         return "empty command"
-    try:
-        bad = [s for s in segments if not segment_ok(s, cwd or os.getcwd())]
-    except ValueError:
-        return "command could not be parsed"
-    if bad:
-        return f"only read-only git/gh commands are allowed here (rejected: {bad[0][:120]!r})"
+    for segment in segments:
+        try:
+            reason = segment_reason(segment, cwd or os.getcwd())
+        except ValueError:
+            return "command could not be parsed"
+        if reason:
+            return f"{reason} (rejected: {segment.strip()[:120]!r})"
     return None
 
 
@@ -280,10 +386,15 @@ def deny(reason):
 
 
 def main():
+    raw = sys.stdin.read()
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(raw)
     except Exception:
-        return  # no payload: cannot tell which agent this is, so stay out of the way
+        # Unreadable payload. Stay out of the way unless it names one of the
+        # read-only agents, where the guard fails closed.
+        if any(f"{PLUGIN}:{name}" in raw for name in READ_ONLY_AGENTS):
+            deny("Read-only agent: the hook payload could not be read.")
+        return
     if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
         return
     if not is_read_only_agent(payload.get("agent_type")):
