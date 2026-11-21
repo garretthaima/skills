@@ -1,0 +1,14 @@
+{
+    "name": "garretthaima-skills",
+    "description": "Workflow skills, agents and hooks for Claude Code",
+    "owner": {
+        "name": "garretthaima"
+    },
+    "plugins": [
+        {
+            "name": "flow",
+            "source": "./plugins/flow",
+            "description": "Issue to merged PR: file issues, drive them with one agent each, review independently, merge, close epics, audit docs"
+        }
+    ]
+}
